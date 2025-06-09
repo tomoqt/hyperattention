@@ -52,22 +52,9 @@ class HigherOrderAttention(nn.Module):
                                       for _ in range(order - 1)])
         self.v_projs = nn.ModuleList([nn.Linear(embed_dim, n_head * head_dim, bias=False)
                                       for _ in range(order - 1)])
+        self.gate_projs = nn.ModuleList([nn.Linear(embed_dim, n_head, bias=False)
+                                         for _ in range(order-1)])
         self.out_proj = nn.Linear(n_head * head_dim, embed_dim, bias=False)
-
-    # ---------------- helper: gather along time --------------------
-    @staticmethod
-    def _gather_time(tensor, idx):
-        """
-        tensor : (B, H, T, D)
-        idx    : (B, H, T, k)   indices < T   (no future positions)
-        return : (B, H, T, k, D)
-        """
-        B, H, T, D = tensor.shape
-        k = idx.size(-1)
-        # make both tensors 5-D so torch.gather ranks match
-        tensor_5d = tensor.unsqueeze(3).expand(-1, -1, -1, k, -1)        # (B,H,T,k,D)
-        idx_5d    = idx.unsqueeze(-1).expand(-1, -1, -1, -1, D)          # (B,H,T,k,D)
-        return torch.gather(tensor_5d, 2, idx_5d)                        # dim=2 is T
 
     # ---------------- split heads ----------------------------------
     @staticmethod
@@ -78,6 +65,7 @@ class HigherOrderAttention(nn.Module):
     # ---------------- forward --------------------------------------
     def forward(self, x):
         B, T, _ = x.shape
+        H = self.n_head
         k_keep = max(1, math.ceil(T ** (2.0 / self.order)))
         dev = x.device
         t_arange = torch.arange(T, device=dev)
@@ -87,44 +75,47 @@ class HigherOrderAttention(nn.Module):
         Ks = [self._split_head(kp(x), self.n_head, self.head_dim) for kp in self.k_projs]
         Vs = [self._split_head(vp(x), self.n_head, self.head_dim) for vp in self.v_projs]
 
-        gathered_K, gathered_V, letters = [], [], []
+        gathered_K, gathered_V, letters, all_top_indices = [], [], [], []
         for r, (K_r, V_r) in enumerate(zip(Ks, Vs)):
-            # 2) compute raw logits and mask future positions
-            logits = torch.einsum("b h t d, b h s d -> b h t s", q, K_r) * self.scale
-            causal_mask = (t_arange[None,None,:,None] < t_arange[None,None,None,:])  # True where s>t
-            logits = logits.masked_fill(causal_mask, float("-inf"))
+            # 2) compute gate logits for selecting tokens
+            gate_logits = self.gate_projs[r](x).transpose(1, 2)              # (B,H,T)
 
-            # 3) dynamic per-time top-k
-            #    build an empty tensor for indices of shape (B,H,T,k_keep)
-            topk_idx = torch.zeros(B, self.n_head, T, k_keep, dtype=torch.long, device=dev)
-            for t in range(T):
-                # only consider keys 0..t
-                valid_slice = logits[:, :, t, :t+1]                # (B,H,t+1)
-                this_k = min(k_keep, t+1)
-                _, idx_t = valid_slice.topk(this_k, dim=-1)        # (B,H,this_k)
-                if this_k < k_keep:
-                    # pad the rest with the last valid index (or zero)
-                    pad = idx_t[:, :, -1:].expand(-1, -1, k_keep - this_k)
-                    idx_t = torch.cat([idx_t, pad], dim=-1)       # (B,H,k_keep)
-                topk_idx[:, :, t, :] = idx_t
+            # 3) static top-k over the whole sequence
+            _, top_indices = gate_logits.topk(k_keep, dim=-1) # (B, H, k_keep)
+            all_top_indices.append(top_indices)
 
-            # store for debug / forward-leak test
-            self._last_topk = topk_idx
+            # store for debug / forward-leak test (just the last one)
+            self._last_topk = top_indices
 
             # 4) gather the actual K/V
-            gathered_K.append(self._gather_time(K_r, topk_idx))
-            gathered_V.append(self._gather_time(V_r, topk_idx))
+            idx = top_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+            gathered_K.append(K_r.gather(2, idx))
+            gathered_V.append(V_r.gather(2, idx))
             letters.append(self.letters[r+1])
 
-        # 5) compute higher-order logits & values exactly as before
-        einsum_in  = ["b h i d"] + [f"b h i {ltr} d" for ltr in letters]
+        # 5) compute higher-order logits
+        einsum_in  = ["b h i d"] + [f"b h {ltr} d" for ltr in letters]
         einsum_out = "b h i " + "".join(letters)
         A = torch.einsum(", ".join(einsum_in) + " -> " + einsum_out,
                          q, *gathered_K) * self.scale
+
+        # 6) compute and apply higher-order causal mask
+        causal_masks = [(idx.unsqueeze(2) <= t_arange.view(1, 1, T, 1)) for idx in all_top_indices]
+        if self.order > 1:
+            reshaped_masks = []
+            for r in range(self.order - 1):
+                shape = [B, H, T] + [1]*(self.order - 1)
+                shape[3+r] = k_keep
+                reshaped_masks.append(causal_masks[r].view(*shape))
+            final_mask = reshaped_masks[0]
+            for r in range(1, self.order - 1):
+                final_mask = final_mask & reshaped_masks[r]
+            A = A.masked_fill(~final_mask, float("-inf"))
+
         alpha = self.dropout(torch.softmax(A, dim=-1))
 
         einsum_in  = ["b h i " + "".join(letters)] + \
-                     [f"b h i {ltr} d" for ltr in letters]
+                     [f"b h {ltr} d" for ltr in letters]
         out = torch.einsum(", ".join(einsum_in) + " -> b h i d",
                            alpha, *gathered_V)
 

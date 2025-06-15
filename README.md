@@ -18,6 +18,38 @@ By explicitly modeling n-ary relationships between tokens, we aim to unlock a ne
 
 We use the minimal and efficient nanoGPT implementation as our foundation, modifying key components to incorporate higher-order attention. The code is designed to be as lightweight and readable as possible while enabling meaningful experiments.
 
+### Higher-Order Attention Formulation
+
+Standard self-attention computes pairwise interactions. For a query token \(q_i\) and a key token \(k_j\), the attention score is based on their dot product. Our higher-order attention mechanism extends this to capture interactions between tuples of tokens.
+
+Given an input sequence, for each token, we compute one query vector \(q_i\) and \(n-1\) sets of key and value vectors, \(\{k^m_i\}_{m=1}^{n-1}\) and \(\{v^m_i\}_{m=1}^{n-1}\), where \(n\) is the order of attention. For a single head with hidden dimension \(d\), the formulation is as follows:
+
+1.  **Attention Scores**: The score for a query token \(i\) and a tuple of \(n-1\) key tokens \((j_1, \dots, j_{n-1})\) is computed via a sum-product over the head dimension \(d\):
+    \[
+    \text{score}(i, j_1, \dots, j_{n-1}) = \frac{1}{\sqrt{d}} \sum_{l=1}^{d} q_{il} \cdot k^1_{j_1 l} \cdot \dots \cdot k^{n-1}_{j_{n-1} l}
+    \]
+    This can also be expressed using the Hadamard (element-wise) product \(\odot\):
+    \[
+    \text{score}(i, j_1, \dots, j_{n-1}) = \frac{1}{\sqrt{d}} \mathbf{1}^T (q_i \odot k^1_{j_1} \odot \dots \odot k^{n-1}_{j_{n-1}})
+    \]
+
+2.  **Attention Weights**: The weights are obtained by applying a softmax over all possible key-token tuples for each query token. Causal masking is applied to prevent attending to future tokens.
+    \[
+    A_{i, j_1, \dots, j_{n-1}} = \text{softmax}_{j_1, \dots, j_{n-1}} \left( \text{score}(i, j_1, \dots, j_{n-1}) \right)
+    \]
+
+3.  **Aggregated Values**: The value vector for a key-tuple is an element-wise product of their individual value vectors:
+    \[
+    V_{j_1, \dots, j_{n-1}} = v^1_{j_1} \odot v^2_{j_2} \odot \dots \odot v^{n-1}_{j_{n-1}}
+    \]
+
+4.  **Output**: The final output for token \(i\) is a weighted sum over the aggregated values:
+    \[
+    y_i = \sum_{j_1, \dots, j_{n-1}} A_{i, j_1, \dots, j_{n-1}} \cdot V_{j_1, \dots, j_{n-1}}
+    \]
+
+This formulation allows a single attention head to directly model n-ary relationships between tokens in a sequence.
+
 ## Dataset Preparation
 
 For experimenting with mixed curvature transformers, we use the same dataset preparation approach as the original nanoGPT:

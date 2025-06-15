@@ -12,7 +12,7 @@ max_iters = 60000
 lr_decay_iters = 60000
 n_layer = 8
 n_head = 6
-n_embd = 1024
+n_embd = 1026
 dropout = 0.0
 # eval stuff
 eval_interval = 100

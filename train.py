@@ -161,6 +161,9 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 use_baseline_model = False # whether to use the baseline model from model_baseline.py
+order = 3
+higher_order_mode = 'interleaved' # 'none', 'interleaved', 'sequential'
+interleave_ratio = 3
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -247,8 +250,16 @@ def get_batch(split):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    x_np_list = [(data[i:i+block_size]).astype(np.int64) for i in ix]
+    y_np_list = [(data[i+1:i+1+block_size]).astype(np.int64) for i in ix]
+
+    # Filter out invalid tokens by replacing them with padding token 0
+    for batch_idx in range(batch_size):
+        x_np_list[batch_idx] = np.where(x_np_list[batch_idx] > 50257, 0, x_np_list[batch_idx]) #this is because the dataset seems to contain some artifaacts, with indices over 50257. but it's just 20 o them and spaced out quite  systematically, so i'm assuming it's just a mistake in tokenization, and we're still properly tokenizing most tokens.
+        y_np_list[batch_idx] = np.where(y_np_list[batch_idx] > 50257, 0, y_np_list[batch_idx])
+
+    x = torch.stack([torch.from_numpy(arr) for arr in x_np_list])
+    y = torch.stack([torch.from_numpy(arr) for arr in y_np_list])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -272,6 +283,9 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+if not use_baseline_model:
+    model_args.update(dict(order=order, higher_order_mode=higher_order_mode, interleave_ratio=interleave_ratio))
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -291,6 +305,11 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    # for backwards compatibility, only load these if they are in the checkpoint
+    if not use_baseline_model:
+        for k in ['order', 'higher_order_mode', 'interleave_ratio']:
+            if k in checkpoint_model_args:
+                model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -312,6 +331,10 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+    # for our new params, since they are not in pretrained gpt2, we set them from the config
+    if not use_baseline_model:
+        for k in ['order', 'higher_order_mode', 'interleave_ratio']:
+            model_args[k] = globals()[k]
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -404,6 +427,8 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+raw_model = model.module if ddp else model # unwrap DDP container if needed
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -438,12 +463,12 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.watch(model.module if ddp else model, log='all')
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
 
@@ -474,8 +499,8 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
-            
-
+            if 'num_params' not in log_dict:
+                log_dict['num_params'] = raw_model.get_num_params()
             
             wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:

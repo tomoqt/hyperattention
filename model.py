@@ -1,262 +1,362 @@
 """
-Full definition of a GPT Language Model with higher-order attention.
-Adds one "mixed" block (order-2 followed by order-3 attention) every 4
-regular blocks.  Drop-in replacement for the original minGPT file.
+Full definition of a GPT Language Model, all of it in this single file.
+References:
+1) the official GPT-2 TensorFlow implementation released by OpenAI:
+https://github.com/openai/gpt-2/blob/master/src/model.py
+2) huggingface/transformers PyTorch implementation:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import math, inspect
+import math
+import inspect
 from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# ---------------------------------------------------------------------
-#  LayerNorm with optional bias
-# ---------------------------------------------------------------------
 class LayerNorm(nn.Module):
+    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+
     def __init__(self, ndim, bias):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias   = nn.Parameter(torch.zeros(ndim)) if bias else None
-    def forward(self, x):
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-# ---------------------------------------------------------------------
-#  Rotary + RMSNorm helpers (optional, unused here but left for completeness)
-# ---------------------------------------------------------------------
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+class Higher_order_self_attention(nn.Module):
+    ''' 
+    Higher order attention. The idea is to extend regular attention in the shape of 
+    A_ij...z = softmax( sum_l Q_ilK^{1}_jl...K^{n}_jz /sqrt(d) )
+    V_j...z is a tensor product of order-1 value vectors.
+    attention scores are normalized by taking the softmax over the slice: softmax (scores.flatten(start_dim=3, end_dim = -1)); this is assuming scores are shape as (B,H,T, T,...T) so that we normalize wrt higher order objects connected to the same token 
+    normalized scores and value function contract as out_i = sum_j...z A_ij...z * V_j...z
+    '''
+    
+    def __init__(self,config):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-    def forward(self, x):
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
-        return self.weight * (x / rms)
+        assert config.n_embd % config.n_head == 0
+        self.order = config.order 
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+        self.dropout = config.dropout
+        
+        # key, query, value projections
+        self.key_projs = nn.Linear(config.n_embd, (self.order-1)*config.n_embd, bias = config.bias)
+        self.value_projs = nn.Linear(config.n_embd, (self.order-1)*config.n_embd, bias = config.bias)
+        self.query_proj = nn.Linear(config.n_embd, config.n_embd, bias = config.bias )
+        
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-# ------------------------------------------------------------------
-#  Higher-order attention  (causal, top-k, order ≥ 2)
-# ------------------------------------------------------------------
-class HigherOrderAttention(nn.Module):
-    letters = "ijklmnopqrstuvwxyz"
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
-    def __init__(self, order: int, n_head: int, embed_dim: int,
-                 head_dim: int = 64, dropout: float = 0.0):
-        super().__init__()
-        assert order >= 2
-        self.order, self.n_head, self.head_dim = order, n_head, head_dim
-        self.scale = head_dim ** -0.5
-        self.dropout = nn.Dropout(dropout)
+        # causal mask
+        causal_mask = self.build_causal_mask(config.block_size, self.order)
+        self.register_buffer("causal_mask", causal_mask)
 
-        self.q_proj  = nn.Linear(embed_dim, n_head * head_dim, bias=False)
-        self.k_projs = nn.ModuleList([nn.Linear(embed_dim, n_head * head_dim, bias=False)
-                                      for _ in range(order - 1)])
-        self.v_projs = nn.ModuleList([nn.Linear(embed_dim, n_head * head_dim, bias=False)
-                                      for _ in range(order - 1)])
-        self.gate_projs = nn.ModuleList([nn.Linear(embed_dim, n_head, bias=False)
-                                         for _ in range(order-1)])
-        self.out_proj = nn.Linear(n_head * head_dim, embed_dim, bias=False)
+    def build_causal_mask(self, size, order):
+        q_indices = torch.arange(size).view(size, *([1] * (order - 1)))
+        mask = torch.ones((size,) * order, dtype=torch.bool)
+        for i in range(1, order):
+            k_indices_shape = [1] * order
+            k_indices_shape[i] = size
+            k_indices = torch.arange(size).view(*k_indices_shape)
+            mask = mask & (q_indices >= k_indices)
+        return mask.view((1, 1) + (size,) * order)
 
-    # ---------------- split heads ----------------------------------
-    @staticmethod
-    def _split_head(x, n_head, head_dim):
-        B, T, _ = x.shape
-        return x.view(B, T, n_head, head_dim).transpose(1, 2).contiguous()  # (B,H,T,D)
 
-    # ---------------- forward --------------------------------------
-    def forward(self, x):
-        B, T, _ = x.shape
-        H = self.n_head
-        k_keep = max(1, math.ceil(T ** (2.0 / self.order)))
-        dev = x.device
-        t_arange = torch.arange(T, device=dev)
+    def forward(self,x):
+        B,T,C = x.size()
+        hs = C // self.n_head
 
-        # 1) project Q,K,V as before
-        q = self._split_head(self.q_proj(x), self.n_head, self.head_dim)
-        Ks = [self._split_head(kp(x), self.n_head, self.head_dim) for kp in self.k_projs]
-        Vs = [self._split_head(vp(x), self.n_head, self.head_dim) for vp in self.v_projs]
+        # calculate query, keys, values 
+        q = self.query_proj(x)
+        ks = self.key_projs(x).split(self.n_embd, dim=2)
+        vs = self.value_projs(x).split(self.n_embd, dim=2)
 
-        gathered_K, gathered_V, letters, all_top_indices = [], [], [], []
-        for r, (K_r, V_r) in enumerate(zip(Ks, Vs)):
-            # 2) compute gate logits for selecting tokens
-            gate_logits = self.gate_projs[r](x).transpose(1, 2)              # (B,H,T)
+        # reshape for multi-head attention
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2) # (B, H, T, hs)
+        ks = [k.view(B, T, self.n_head, hs).transpose(1, 2) for k in ks]
+        vs = [v.view(B, T, self.n_head, hs).transpose(1, 2) for v in vs]
+        
+        # Einsum strings for attention scores
+        q_indices = 'bhqd'
+        k_indices_str = ''
+        out_indices = 'bhq'
+        alphabet = 'ijklmnopqrstuvwxyz'
+        k_operands = []
+        for i in range(self.order - 1):
+            k_idx_char = alphabet[i]
+            k_indices_str += f',bh{k_idx_char}d'
+            out_indices += k_idx_char
+            k_operands.append(ks[i])
+        
+        einsum_str = q_indices + k_indices_str + '->' + out_indices
+        scores = torch.einsum(einsum_str, q, *k_operands)
+        scores = scores * (1.0 / math.sqrt(q.size(-1)))
 
-            # 3) static top-k over the whole sequence
-            _, top_indices = gate_logits.topk(k_keep, dim=-1) # (B, H, k_keep)
-            all_top_indices.append(top_indices)
+        # Apply causal mask
+        causal_mask_slice = (slice(None),)*2 + (slice(T),)*self.order
+        scores = scores.masked_fill(self.causal_mask[causal_mask_slice] == 0, float('-inf'))
+        
+        # Normalize scores
+        scores_shape = scores.shape
+        scores = scores.flatten(start_dim=3)
+        att = F.softmax(scores, dim=-1)
+        att = att.view(scores_shape)
+        att = self.attn_dropout(att)
 
-            # store for debug / forward-leak test (just the last one)
-            self._last_topk = top_indices
+        # Einsum strings for output
+        att_indices = out_indices
+        v_indices_str = ''
+        v_operands = []
+        out_indices = 'bhqd'
+        for i in range(self.order - 1):
+            k_idx_char = alphabet[i]
+            v_indices_str += f',bh{k_idx_char}d'
+            v_operands.append(vs[i])
+            
+        einsum_str = att_indices + v_indices_str + '->' + out_indices
+        y = torch.einsum(einsum_str, att, *v_operands)
+        
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
-            # 4) gather the actual K/V
-            idx = top_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-            gathered_K.append(K_r.gather(2, idx))
-            gathered_V.append(V_r.gather(2, idx))
-            letters.append(self.letters[r+1])
 
-        # 5) compute higher-order logits
-        einsum_in  = ["b h i d"] + [f"b h {ltr} d" for ltr in letters]
-        einsum_out = "b h i " + "".join(letters)
-        A = torch.einsum(", ".join(einsum_in) + " -> " + einsum_out,
-                         q, *gathered_K) * self.scale
-
-        # 6) compute and apply higher-order causal mask
-        causal_masks = [(idx.unsqueeze(2) <= t_arange.view(1, 1, T, 1)) for idx in all_top_indices]
-        if self.order > 1:
-            reshaped_masks = []
-            for r in range(self.order - 1):
-                shape = [B, H, T] + [1]*(self.order - 1)
-                shape[3+r] = k_keep
-                reshaped_masks.append(causal_masks[r].view(*shape))
-            final_mask = reshaped_masks[0]
-            for r in range(1, self.order - 1):
-                final_mask = final_mask & reshaped_masks[r]
-            A = A.masked_fill(~final_mask, float("-inf"))
-
-        alpha = self.dropout(torch.softmax(A, dim=-1))
-
-        einsum_in  = ["b h i " + "".join(letters)] + \
-                     [f"b h {ltr} d" for ltr in letters]
-        out = torch.einsum(", ".join(einsum_in) + " -> b h i d",
-                           alpha, *gathered_V)
-
-        out = out.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim)
-        return self.out_proj(out)
-
-# ---------------------------------------------------------------------
-#  Vanilla causal self-attention (order-2)
-# ---------------------------------------------------------------------
 class CausalSelfAttention(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.attn_dropout  = nn.Dropout(config.dropout)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head   = config.n_head
-        self.n_embd   = config.n_embd
-        self.dropout  = config.dropout
-        self.flash    = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size))
-                     .view(1, 1, config.block_size, config.block_size)
-            )
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v,
-                    dropout_p=self.dropout if self.training else 0,
-                    is_causal=True)
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
+            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y   = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.c_proj(y))
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-# ---------------------------------------------------------------------
-#  Feed-forward
-# ---------------------------------------------------------------------
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
 class MLP(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
-    def forward(self, x):
-        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
 
-# ---------------------------------------------------------------------
-#  Standard Transformer block  (order-2 only)
-# ---------------------------------------------------------------------
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
 class Block(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp  = MLP(config)
+        self.mlp = MLP(config)
+
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
-# ---------------------------------------------------------------------
-#  Mixed block: order-2 followed immediately by order-3
-# ---------------------------------------------------------------------
-class MixedBlock(nn.Module):
-    """Used every 4th position in the stack."""
+class GatedHigherOrderAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1  = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn2 = CausalSelfAttention(config)                             # order-2
-        self.ln_hoa = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn3  = HigherOrderAttention(order=3,
-                                           n_head=config.n_head,
-                                           embed_dim=config.n_embd,
-                                           head_dim=config.n_embd // config.n_head,
-                                           dropout=config.dropout)           # order-3
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp  = MLP(config)
+        self.gate_proj = nn.Linear(config.n_embd, 1, bias=config.bias)
+        self.higher_order_attn = Higher_order_self_attention(config)
+        self.order = config.order
+
     def forward(self, x):
-        x = x + self.attn2(self.ln_1(x))
-        x = x + self.attn3(self.ln_hoa(x))
+        B, T, C = x.size()
+        
+        # Gating mechanism
+        scores = self.gate_proj(x)
+        
+        k = int(T**(1/self.order))
+        if k == 0:
+            return torch.zeros_like(x)
+
+        _, top_indices = torch.topk(scores, k, dim=1, sorted=False)
+        top_indices = top_indices.sort(dim=1).values
+        
+        # Gather top-k tokens
+        x_gated = torch.gather(x, 1, top_indices.expand(-1, -1, C))
+        
+        # Apply higher-order attention
+        output_gated = self.higher_order_attn(x_gated)
+
+        # Modulate output by scores to ensure the graph is connected for autograd
+        selected_scores = torch.gather(scores, 1, top_indices)
+        output_gated = output_gated * torch.sigmoid(selected_scores)
+        
+        # Scatter results back
+        output = torch.zeros_like(x)
+        output = output.scatter(1, top_indices.expand(-1, -1, C), output_gated.to(x.dtype))
+        
+        return output
+
+class GatedHigherOrderBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = GatedHigherOrderAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
-# ---------------------------------------------------------------------
-#  GPT configuration
-# ---------------------------------------------------------------------
-@dataclass
-class GPTConfig:
-    block_size : int  = 1024
-    vocab_size : int  = 50304
-    n_layer    : int  = 12
-    n_head     : int  = 12
-    n_embd     : int  = 768
-    dropout    : float = 0.0
-    bias       : bool  = True
-
-# ---------------------------------------------------------------------
-#  GPT model
-# ---------------------------------------------------------------------
-class GPT(nn.Module):
+class SequentialHigherOrderBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.gated_higher_attn = GatedHigherOrderAttention(config)
+        self.ln_3 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.gated_higher_attn(self.ln_2(x))
+        x = x + self.mlp(self.ln_3(x))
+        return x
+
+class HigherOrderBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = Higher_order_self_attention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    order: int = 2 # 2 for standard attention
+    higher_order_mode: str = 'none' # 'none', 'interleaved', 'sequential'
+    interleave_ratio: int = 3
+
+class GPT(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
         self.config = config
+
+        if config.higher_order_mode == 'none':
+            block_type = HigherOrderBlock if config.order > 2 else Block
+            blocks = [block_type(config) for _ in range(config.n_layer)]
+        elif config.higher_order_mode == 'interleaved':
+            blocks = []
+            for i in range(config.n_layer):
+                if (i + 1) % (config.interleave_ratio + 1) == 0:
+                    blocks.append(GatedHigherOrderBlock(config))
+                else:
+                    blocks.append(Block(config))
+        elif config.higher_order_mode == 'sequential':
+            blocks = [SequentialHigherOrderBlock(config) for _ in range(config.n_layer)]
+        else:
+            raise ValueError(f"Unknown higher_order_mode: {config.higher_order_mode}")
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([
-                    MixedBlock(config) if (i % 4 == 3) else Block(config)
-                    for i in range(config.n_layer)
-                ]),
+            h = nn.ModuleList(blocks),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight  # weight tying
+        # with weight tying when using torch.compile() some warnings get generated:
+        # "UserWarning: functional_call was passed multiple values for tied weights.
+        # This behavior is deprecated and will be an error in future versions"
+        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        # init all weights
         self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-        print(f"number of parameters: {self.get_num_params()/1e6:.2f}M")
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-    # --------------------- utilities ---------------------------------
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
     def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
@@ -264,33 +364,35 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None: nn.init.zeros_(module.bias)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # -------------------- forward ------------------------------------
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t   = idx.size()
-        assert t <= self.config.block_size
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
+            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            logits = self.lm_head(x[:, [-1], :])
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
         return logits, loss
 
     def crop_block_size(self, block_size):

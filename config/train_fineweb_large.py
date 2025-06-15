@@ -2,7 +2,7 @@
 
 wandb_log = True
 wandb_project = 'fineweb-tensor_attention'
-wandb_run_name='tensor_attention_medium'
+wandb_run_name='tensor_attention_large'
 
 batch_size = 24
 block_size = 1024

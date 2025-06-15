@@ -4,7 +4,7 @@ wandb_log = True
 wandb_project = 'fineweb-tensor_attention'
 wandb_run_name='tensor_attention_large'
 
-batch_size = 24
+batch_size = 12
 block_size = 1024
 gradient_accumulation_steps =  1
 dataset = 'fineweb'

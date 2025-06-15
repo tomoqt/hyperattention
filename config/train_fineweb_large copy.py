@@ -5,14 +5,14 @@ wandb_project = 'fineweb-tensor_attention'
 wandb_run_name='tensor_attention_medium'
 
 batch_size = 24
-block_size = 512
+block_size = 1024
 gradient_accumulation_steps =  1
 dataset = 'fineweb'
 max_iters = 60000
 lr_decay_iters = 60000
-n_layer = 6
+n_layer = 8
 n_head = 6
-n_embd = 768
+n_embd = 1024
 dropout = 0.0
 # eval stuff
 eval_interval = 100

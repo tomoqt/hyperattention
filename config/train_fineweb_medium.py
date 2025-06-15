@@ -21,9 +21,11 @@ log_interval = 10
 
 # weight decay
 weight_decay = 1e-1
-
 use_muon = False
 muon_lr = 1e-3
 muon_momentum = 0.95
 muon_nesterov = True
 muon_ns_steps = 5
+
+#hyperattention
+higher_order_mode = 'sequential'

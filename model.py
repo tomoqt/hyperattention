@@ -299,8 +299,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    order: int = 2 # 2 for standard attention
-    higher_order_mode: str = 'none' # 'none', 'interleaved', 'sequential'
+    order: int = 3 # 2 for standard attention
+    higher_order_mode: str = 'sequential' # 'none', 'interleaved', 'sequential'
     interleave_ratio: int = 3
 
 class GPT(nn.Module):

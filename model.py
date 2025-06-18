@@ -347,6 +347,21 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
+        # Re-initialize higher-order weights with variance scaling.
+        # We scale the standard deviation by 1/sqrt(order).
+        for m in self.modules():
+            if isinstance(m, Higher_order_self_attention):
+                std = 0.02 * math.sqrt(m.order/2)
+                torch.nn.init.normal_(m.key_projs.weight, mean=0.0, std=std)
+                torch.nn.init.normal_(m.value_projs.weight, mean=0.0, std=std)
+                torch.nn.init.normal_(m.query_proj.weight, mean=0.0, std=std)
+                # Scale the residual projection as well.
+                std_proj = (0.02 / math.sqrt(2 * config.n_layer)) / math.sqrt(m.order)
+                torch.nn.init.normal_(m.c_proj.weight, mean=0.0, std=std_proj)
+            elif isinstance(m, GatedHigherOrderAttention):
+                std = 0.02 * math.sqrt(m.order/2)
+                torch.nn.init.normal_(m.gate_proj.weight, mean=0.0, std=std)
+
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 

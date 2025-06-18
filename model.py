@@ -325,7 +325,7 @@ class GPT(nn.Module):
                 # if interleave_ratio is 0, all blocks are higher order
                 if (i + 1) % (config.interleave_ratio + 1) == 0:
                     
-                    block_config = dataclasses.replace(config, order=current_order)
+                    block_config = dataclass.replace(config, order=current_order)
                     blocks.append(SequentialHigherOrderBlock(block_config))
 
                     # Update order for the next higher-order block

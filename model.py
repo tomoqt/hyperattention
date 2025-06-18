@@ -9,7 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -325,7 +325,7 @@ class GPT(nn.Module):
                 # if interleave_ratio is 0, all blocks are higher order
                 if (i + 1) % (config.interleave_ratio + 1) == 0:
                     
-                    block_config = dataclass.replace(config, order=current_order)
+                    block_config = replace(config, order=current_order)
                     blocks.append(SequentialHigherOrderBlock(block_config))
 
                     # Update order for the next higher-order block

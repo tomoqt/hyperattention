@@ -265,7 +265,7 @@ class SequentialHigherOrderBlock(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        #self.ln_2 = LayerNorm(config.n_embd, bias=config.bias) elt's try no new prenorm
         self.gated_higher_attn = GatedHigherOrderAttention(config)
         self.ln_3 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)

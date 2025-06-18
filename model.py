@@ -300,6 +300,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     order: int = 3 # 2 for standard attention
+    max_order: int = 3 # max order for attention
     higher_order_mode: str = 'sequential' # 'none', 'interleaved', 'sequential'
     interleave_ratio: int = 3
 
@@ -314,15 +315,28 @@ class GPT(nn.Module):
         if config.higher_order_mode == 'none':
             block_type = HigherOrderBlock if config.order > 2 else Block
             blocks = [block_type(config) for _ in range(config.n_layer)]
-        elif config.higher_order_mode == 'interleaved':
+        elif config.higher_order_mode in ['interleaved', 'sequential']:
+            if config.higher_order_mode == 'sequential':
+                config.interleave_ratio = 0
+            
             blocks = []
+            current_order = config.order
             for i in range(config.n_layer):
+                # if interleave_ratio is 0, all blocks are higher order
                 if (i + 1) % (config.interleave_ratio + 1) == 0:
-                    blocks.append(GatedHigherOrderBlock(config))
+                    
+                    block_config = dataclasses.replace(config, order=current_order)
+                    blocks.append(SequentialHigherOrderBlock(block_config))
+
+                    # Update order for the next higher-order block
+                    next_order = current_order + 1
+                    if next_order <= config.max_order:
+                        # Stop increasing order if top_k would become 1 or less
+                        top_k_next = int(config.block_size**(2/next_order))
+                        if top_k_next > 1:
+                            current_order = next_order
                 else:
                     blocks.append(Block(config))
-        elif config.higher_order_mode == 'sequential':
-            blocks = [SequentialHigherOrderBlock(config) for _ in range(config.n_layer)]
         else:
             raise ValueError(f"Unknown higher_order_mode: {config.higher_order_mode}")
 

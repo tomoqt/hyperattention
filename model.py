@@ -364,6 +364,9 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        if config.higher_order_mode in ['interleaved', 'sequential']:
+            top_k = int(config.block_size**(2/config.order))
+            print(f"Using top-k of {top_k} for higher-order attention.")
 
     def get_num_params(self, non_embedding=True):
         """

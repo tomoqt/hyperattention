@@ -224,7 +224,7 @@ class GatedHigherOrderAttention(nn.Module):
         # Gating mechanism
         scores = self.gate_proj(x)
         
-        k = int(T**(1/self.order))
+        k = int(T**(2/self.order))
         if k == 0:
             return torch.zeros_like(x)
 

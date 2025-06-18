@@ -162,6 +162,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 use_baseline_model = False # whether to use the baseline model from model_baseline.py
 order = 3
+max_order = 3
 higher_order_mode = 'interleaved' # 'none', 'interleaved', 'sequential'
 interleave_ratio = 3
 # adamw optimizer
@@ -284,7 +285,7 @@ if os.path.exists(meta_path):
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if not use_baseline_model:
-    model_args.update(dict(order=order, higher_order_mode=higher_order_mode, interleave_ratio=interleave_ratio))
+    model_args.update(dict(order=order, max_order=max_order, higher_order_mode=higher_order_mode, interleave_ratio=interleave_ratio))
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -307,7 +308,7 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # for backwards compatibility, only load these if they are in the checkpoint
     if not use_baseline_model:
-        for k in ['order', 'higher_order_mode', 'interleave_ratio']:
+        for k in ['order', 'max_order', 'higher_order_mode', 'interleave_ratio']:
             if k in checkpoint_model_args:
                 model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -333,7 +334,7 @@ elif init_from.startswith('gpt2'):
         model_args[k] = getattr(model.config, k)
     # for our new params, since they are not in pretrained gpt2, we set them from the config
     if not use_baseline_model:
-        for k in ['order', 'higher_order_mode', 'interleave_ratio']:
+        for k in ['order', 'max_order', 'higher_order_mode', 'interleave_ratio']:
             model_args[k] = globals()[k]
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:

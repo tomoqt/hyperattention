@@ -298,7 +298,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     order: int = 3 # 2 for standard attention
     max_order: int = 3 # max order for attention
     higher_order_mode: str = 'sequential' # 'none', 'interleaved', 'sequential'
